@@ -3,12 +3,12 @@
     <channel>
         <title>UltraDownloader</title>
         <item>
-            <title>1.0.1</title>
-            <pubDate>Mon, 22 Jun 2026 13:38:07 +0200</pubDate>
-            <sparkle:version>2</sparkle:version>
-            <sparkle:shortVersionString>1.0.1</sparkle:shortVersionString>
+            <title>1.0.2</title>
+            <pubDate>Tue, 23 Jun 2026 19:36:31 +0200</pubDate>
+            <sparkle:version>3</sparkle:version>
+            <sparkle:shortVersionString>1.0.2</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>26.5</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/devKonsti/ultradownloader/releases/download/v1.0.1/UltraDownloader-1.0.1.zip" length="116560573" type="application/octet-stream" sparkle:edSignature="PVyBa/OmAGjjUfwUDhclOr4f9j8In5Z1iHplBVIXCORoEN5WgHNJz00v7SRqK9QT2lBQr3Nx7aNqPuaTmOkEAQ=="/>
+            <enclosure url="https://github.com/devKonsti/ultradownloader/releases/download/v1.0.2/UltraDownloader-1.0.2.zip" length="116570951" type="application/octet-stream" sparkle:edSignature="voCdM4ZBLBmwxVzQHeU8JQ6ABLt0BJQ8AX7c8Flc3Ikd1JzvSBkG8l5ih4Nfok4CJqByQibKUOuSfVFlqodlAA=="/>
         </item>
     </channel>
 </rss>
