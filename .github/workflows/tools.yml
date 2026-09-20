@@ -175,8 +175,14 @@ jobs:
           REPORTED=$(./yt/bin/python -m yt_dlp --version)
           [ "$REPORTED" = "${{ steps.latest.outputs.yt_version }}" ] || { echo "::error::yt-dlp reports $REPORTED"; exit 1; }
           # A direct-file URL (YouTube often blocks CI IPs): checks extraction + our ffmpeg/deno flags parse.
-          ./yt/bin/python -m yt_dlp --simulate --no-playlist --ffmpeg-location "$PWD/ffmpeg" \
-            --js-runtimes "deno:$DN" "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4"
+          # Two independent hosts — either one answering is enough, so one flaky site can't fail the job.
+          OKURL=""
+          for u in "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4" \
+                   "https://download.samplelib.com/mp3/sample-3s.mp3"; do
+            if ./yt/bin/python -m yt_dlp --simulate --no-playlist --ffmpeg-location "$PWD/ffmpeg" \
+                 --js-runtimes "deno:$DN" "$u"; then OKURL="$u"; break; fi
+          done
+          [ -n "$OKURL" ] || { echo "::error::yt-dlp couldn't extract from either test host"; exit 1; }
           echo "ok yt-dlp"
 
       - name: Package + sign
