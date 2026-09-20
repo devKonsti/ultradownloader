@@ -1,0 +1,238 @@
+# The "tools channel" — keeps ffmpeg (+ ffprobe), deno and yt-dlp current for every installed UltraDownloader
+# WITHOUT an app release. Runs weekly on GitHub's macOS (Apple Silicon) runner.
+#
+# LIVES IN THE REPO AS:  .github/workflows/tools.yml   (source copy: scripts/tools-workflow.yml)
+#
+# What it does:
+#   1. Finds the newest ffmpeg/ffprobe (Martin Riedl's macOS builds, SHA256-checked), deno (official
+#      GitHub release, SHA256-checked) and yt-dlp (PyPI).
+#   2. Compares with the currently published tools.json. Nothing new → stops (no release, no noise).
+#   3. SMOKE-TESTS the new tools — real encodes of every audio format we offer, an mp4 remux, the
+#      encoders we depend on, deno, and a real yt-dlp run. ANY failure fails the job (GitHub emails
+#      the repo owner) and NOTHING is published.
+#   4. Uploads the zips to the rolling release "tools", then publishes tools.json + tools.json.sig
+#      (signed with the tools key from the TOOLS_PRIVATE_KEY secret). Installed apps only trust a
+#      feed signed by the matching public key baked into the app.
+#
+# Secret needed:  TOOLS_PRIVATE_KEY  (from `swift scripts/tools-keygen.swift`; backup in the password manager)
+
+name: Tools channel
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"          # Mondays 05:23 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Publish even if nothing changed"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Test everything (download, smoke tests, signing) but do NOT publish"
+        type: boolean
+        default: false
+      critical:
+        description: "Mark this update CRITICAL: apps open their window on Updates (use only when the app can't work without it)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write                 # release assets + heartbeat commit
+  actions: write                  # keep this schedule switched on
+
+concurrency: tools-channel
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  REPO: ${{ github.repository }}
+  FEED: https://github.com/${{ github.repository }}/releases/download/tools
+
+jobs:
+  tools:
+    runs-on: macos-15             # Apple Silicon — the app is Apple Silicon only
+    timeout-minutes: 30
+    steps:
+      # GitHub switches scheduled workflows OFF after 60 days without repo activity. Two belts:
+      # re-enable ourselves every run, and make a tiny commit if the repo has been quiet for a month.
+      - name: Keep the schedule alive
+        run: |
+          gh api -X PUT "repos/$REPO/actions/workflows/tools.yml/enable" || true
+          LAST=$(gh api "repos/$REPO/commits?per_page=1" --jq '.[0].commit.committer.date')
+          AGE=$(( ( $(date -u +%s) - $(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$LAST" +%s) ) / 86400 ))
+          echo "last repo commit: $LAST ($AGE days ago)"
+          if [ "$AGE" -ge 30 ]; then
+            SHA=$(gh api "repos/$REPO/contents/heartbeat.txt" --jq .sha 2>/dev/null || true)
+            gh api "repos/$REPO/contents/heartbeat.txt" -X PUT -f message="tools channel heartbeat" \
+              -f content="$(date -u +%FT%TZ | base64)" ${SHA:+-f sha="$SHA"} >/dev/null
+          fi
+
+      - name: Find the newest versions
+        id: latest
+        run: |
+          set -euo pipefail
+          mkdir -p work && cd work
+
+          # ffmpeg + ffprobe — Martin Riedl's macOS arm64 release builds
+          HTML=$(curl -fsSL https://ffmpeg.martin-riedl.de/info/history/macos/arm64/release)
+          ID=$(printf '%s' "$HTML" | grep -oE '/info/detail/macos/arm64/[0-9]+_[0-9]+(\.[0-9]+)*' | head -1 | sed 's|.*/||')
+          [ -n "$ID" ] || { echo "::error::Couldn't read the latest ffmpeg build from the build server"; exit 1; }
+          echo "ffmpeg_version=${ID#*_}" >> "$GITHUB_OUTPUT"
+          echo "ffmpeg_base=https://ffmpeg.martin-riedl.de/download/macos/arm64/$ID" >> "$GITHUB_OUTPUT"
+
+          # deno — official release
+          DENO_TAG=$(gh api repos/denoland/deno/releases/latest --jq .tag_name)
+          echo "deno_version=${DENO_TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "deno_tag=$DENO_TAG" >> "$GITHUB_OUTPUT"
+
+          # yt-dlp — PyPI writes 2026.8.19, yt-dlp itself (and our feed) uses 2026.08.19
+          PYPI=$(curl -fsSL https://pypi.org/pypi/yt-dlp/json | python3 -c "import sys,json; print(json.load(sys.stdin)['info']['version'])")
+          YT=$(python3 -c "import sys; p=sys.argv[1].split('.'); print('%s.%02d.%02d' % (p[0], int(p[1]), int(p[2])) + ('.'+'.'.join(p[3:]) if len(p)>3 else ''))" "$PYPI")
+          echo "yt_version=$YT" >> "$GITHUB_OUTPUT"
+
+      - name: Is anything new?
+        id: changed
+        run: |
+          set -euo pipefail
+          CUR=$(curl -fsSL "$FEED/tools.json" 2>/dev/null || echo '{"tools":{}}')
+          cur() { printf '%s' "$CUR" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tools',{}).get('$1',{}).get('version',''))"; }
+          if [ "${{ github.event.inputs.force }}" = "true" ] \
+             || [ "$(cur ffmpeg)" != "${{ steps.latest.outputs.ffmpeg_version }}" ] \
+             || [ "$(cur deno)" != "${{ steps.latest.outputs.deno_version }}" ] \
+             || [ "$(cur yt-dlp)" != "${{ steps.latest.outputs.yt_version }}" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing new — feed already current."
+          fi
+
+      - name: Download + verify the binaries
+        if: steps.changed.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          cd work
+          mkdir -p ffmpeg deno
+          B="${{ steps.latest.outputs.ffmpeg_base }}"
+          for f in ffmpeg ffprobe; do
+            curl -fsSL -o "$f.zip" "$B/$f.zip"
+            EXPECT=$(curl -fsSL "$B/$f.zip.sha256" | awk '{print $1}')
+            ACTUAL=$(shasum -a 256 "$f.zip" | awk '{print $1}')
+            [ "$EXPECT" = "$ACTUAL" ] || { echo "::error::$f checksum mismatch"; exit 1; }
+            unzip -o -q "$f.zip" -d ffmpeg
+          done
+          T="${{ steps.latest.outputs.deno_tag }}"
+          curl -fsSL -o deno.zip "https://github.com/denoland/deno/releases/download/$T/deno-aarch64-apple-darwin.zip"
+          EXPECT=$(curl -fsSL "https://github.com/denoland/deno/releases/download/$T/deno-aarch64-apple-darwin.zip.sha256sum" | awk '{print $1}')
+          [ "$EXPECT" = "$(shasum -a 256 deno.zip | awk '{print $1}')" ] || { echo "::error::deno checksum mismatch"; exit 1; }
+          unzip -o -q deno.zip -d deno
+          chmod +x ffmpeg/ffmpeg ffmpeg/ffprobe deno/deno
+          # Apple Silicon refuses unsigned binaries; make sure each carries at least an ad-hoc signature.
+          for b in ffmpeg/ffmpeg ffmpeg/ffprobe deno/deno; do
+            codesign --verify "$b" 2>/dev/null || codesign -s - -f "$b"
+          done
+          file ffmpeg/ffmpeg ffmpeg/ffprobe deno/deno
+
+      - name: Smoke tests (fail = nothing is published)
+        if: steps.changed.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          cd work
+          FF=$PWD/ffmpeg/ffmpeg; FP=$PWD/ffmpeg/ffprobe; DN=$PWD/deno/deno
+          "$FF" -version | head -1; "$FP" -version | head -1; "$DN" --version | head -1
+
+          echo "--- encoders we depend on"
+          ENC=$("$FF" -hide_banner -encoders)
+          for e in hevc_videotoolbox libmp3lame libopus aac flac pcm_s16le; do
+            printf '%s' "$ENC" | grep -qw "$e" || { echo "::error::ffmpeg is missing encoder $e"; exit 1; }
+          done
+
+          echo "--- real encodes: every audio format we offer"
+          mkdir -p t && cd t
+          for spec in "mp3:libmp3lame" "m4a:aac" "opus:libopus" "flac:flac" "wav:pcm_s16le"; do
+            ext=${spec%%:*}; codec=${spec##*:}
+            "$FF" -hide_banner -loglevel error -y -f lavfi -i "sine=frequency=440:duration=2" -c:a "$codec" "out.$ext"
+            [ "$("$FP" -v error -show_entries stream=codec_type -of csv=p=0 "out.$ext")" = "audio" ] || { echo "::error::$ext encode produced no audio"; exit 1; }
+            echo "ok $ext"
+          done
+
+          echo "--- mp4 remux (what the app does for <=1080p)"
+          "$FF" -hide_banner -loglevel error -y -f lavfi -i "testsrc=duration=2:size=1280x720:rate=30" \
+            -f lavfi -i "sine=frequency=440:duration=2" -c:v libx264 -pix_fmt yuv420p -c:a aac src.mp4
+          "$FF" -hide_banner -loglevel error -y -i src.mp4 -c copy -movflags +faststart remux.mp4
+          [ "$("$FP" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 remux.mp4)" = "h264" ] || { echo "::error::remux failed"; exit 1; }
+          echo "ok remux"
+
+          echo "--- HEVC hardware encode (VMs may not have the hardware — warning only)"
+          "$FF" -hide_banner -loglevel error -y -f lavfi -i "testsrc=duration=1:size=1920x1080:rate=30" \
+            -c:v hevc_videotoolbox -q:v 65 -tag:v hvc1 hevc.mp4 && echo "ok hevc" \
+            || echo "::warning::hevc_videotoolbox real encode isn't possible on this runner (encoder is listed, so it's expected on real Macs)"
+
+          echo "--- deno"
+          echo 'console.log(1+1)' > t.js; [ "$("$DN" run t.js)" = "2" ] || { echo "::error::deno can't run code"; exit 1; }
+
+          echo "--- yt-dlp (pinned version, clean environment)"
+          cd "$GITHUB_WORKSPACE/work"
+          python3 -m venv yt && ./yt/bin/pip install -q "yt-dlp==${{ steps.latest.outputs.yt_version }}"
+          REPORTED=$(./yt/bin/python -m yt_dlp --version)
+          [ "$REPORTED" = "${{ steps.latest.outputs.yt_version }}" ] || { echo "::error::yt-dlp reports $REPORTED"; exit 1; }
+          # A direct-file URL (YouTube often blocks CI IPs): checks extraction + our ffmpeg/deno flags parse.
+          ./yt/bin/python -m yt_dlp --simulate --no-playlist --ffmpeg-location "$PWD/ffmpeg" \
+            --js-runtimes "deno:$DN" "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4"
+          echo "ok yt-dlp"
+
+      - name: Package + sign
+        if: steps.changed.outputs.publish == 'true'
+        env:
+          TOOLS_PRIVATE_KEY: ${{ secrets.TOOLS_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          cd work
+          FFV="${{ steps.latest.outputs.ffmpeg_version }}"; DNV="${{ steps.latest.outputs.deno_version }}"; YTV="${{ steps.latest.outputs.yt_version }}"
+          mkdir -p out
+          ditto -c -k ffmpeg "out/ffmpeg-$FFV-macos-arm64.zip"
+          ditto -c -k deno   "out/deno-$DNV-macos-arm64.zip"
+          sha() { shasum -a 256 "$1" | awk '{print $1}'; }
+          sz()  { stat -f%z "$1"; }
+          U="https://github.com/$REPO/releases/download/tools"
+          cat > out/tools.json <<EOF
+          {"schema":1,"generated":"$(date -u +%FT%TZ)","tools":{
+           "ffmpeg":{"version":"$FFV","url":"$U/ffmpeg-$FFV-macos-arm64.zip","sha256":"$(sha out/ffmpeg-$FFV-macos-arm64.zip)","size":$(sz out/ffmpeg-$FFV-macos-arm64.zip),"files":["ffmpeg","ffprobe"]},
+           "deno":{"version":"$DNV","url":"$U/deno-$DNV-macos-arm64.zip","sha256":"$(sha out/deno-$DNV-macos-arm64.zip)","size":$(sz out/deno-$DNV-macos-arm64.zip),"files":["deno"]},
+           "yt-dlp":{"version":"$YTV"}}}
+          EOF
+          python3 -c "import json; json.load(open('out/tools.json'))"   # must be valid JSON
+          if [ "${{ github.event.inputs.critical }}" = "true" ]; then
+            python3 -c "import json; d=json.load(open('out/tools.json')); [e.update(critical=True) for e in d['tools'].values()]; json.dump(d, open('out/tools.json','w'))"
+            echo "marked CRITICAL"
+          fi
+
+          cat > sign.swift <<'SWIFT'
+          import CryptoKit
+          import Foundation
+          guard let b64 = ProcessInfo.processInfo.environment["TOOLS_PRIVATE_KEY"],
+                let raw = Data(base64Encoded: b64.trimmingCharacters(in: .whitespacesAndNewlines)),
+                let key = try? Curve25519.Signing.PrivateKey(rawRepresentation: raw) else { print("no/invalid key"); exit(1) }
+          let path = CommandLine.arguments[1]
+          let sig = try key.signature(for: try Data(contentsOf: URL(fileURLWithPath: path)))
+          try Data(sig.base64EncodedString().utf8).write(to: URL(fileURLWithPath: path + ".sig"))
+          SWIFT
+          swift sign.swift out/tools.json
+          ls -la out
+
+      - name: Publish
+        if: steps.changed.outputs.publish == 'true' && github.event.inputs.dry_run != 'true'
+        run: |
+          set -euo pipefail
+          cd work/out
+          gh release view tools --repo "$REPO" >/dev/null 2>&1 \
+            || gh release create tools --repo "$REPO" --title "Tools channel" --latest=false \
+                 --notes "Rolling release. Holds the newest ffmpeg / deno builds and the signed tools.json that installed UltraDownloader apps check. Updated automatically — do not edit."
+          # Zips first, the signed feed LAST, so the app never sees a feed that points at a missing file.
+          gh release upload tools --repo "$REPO" --clobber ffmpeg-*.zip deno-*.zip
+          gh release upload tools --repo "$REPO" --clobber tools.json tools.json.sig
+          # Tidy: drop zips the new feed no longer references.
+          KEEP=$(python3 -c "import json,os; print(' '.join(os.path.basename(t['url']) for t in json.load(open('tools.json'))['tools'].values() if 'url' in t))")
+          for a in $(gh release view tools --repo "$REPO" --json assets --jq '.assets[].name'); do
+            case "$a" in tools.json|tools.json.sig) continue;; esac
+            case " $KEEP " in *" $a "*) ;; *) gh release delete-asset tools "$a" --repo "$REPO" -y;; esac
+          done
+          echo "Published:"; cat tools.json
