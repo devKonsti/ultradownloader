@@ -3,12 +3,21 @@
     <channel>
         <title>UltraDownloader</title>
         <item>
-            <title>1.0.2</title>
-            <pubDate>Tue, 23 Jun 2026 19:36:31 +0200</pubDate>
-            <sparkle:version>3</sparkle:version>
-            <sparkle:shortVersionString>1.0.2</sparkle:shortVersionString>
+            <title>1.0.3</title>
+            <pubDate>Sun, 20 Sep 2026 14:28:21 +0200</pubDate>
+            <sparkle:version>4</sparkle:version>
+            <sparkle:shortVersionString>1.0.3</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>26.5</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/devKonsti/ultradownloader/releases/download/v1.0.2/UltraDownloader-1.0.2.zip" length="116570951" type="application/octet-stream" sparkle:edSignature="voCdM4ZBLBmwxVzQHeU8JQ6ABLt0BJQ8AX7c8Flc3Ikd1JzvSBkG8l5ih4Nfok4CJqByQibKUOuSfVFlqodlAA=="/>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<ul>
+<li>ffmpeg, deno and yt-dlp now update themselves from the Updates page (Download, then Install)</li>
+<li>Dock icon only while the window is open; quiet start in the menu bar at Mac start</li>
+<li>Launch at login is on by default (switch off in Settings)</li>
+<li>Newer, faster ffmpeg (9.0) for conversions</li>
+<li>Fixed a start-up problem that could appear right after an update</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/devKonsti/ultradownloader/releases/download/v1.0.3/UltraDownloader-1.0.3.zip" length="124013988" type="application/octet-stream" sparkle:edSignature="doDR88lnlGc2zbeBPLKBavhdw4f2xFj/hSlPgMXSYKM/TEBf/xZJsWBXZbcv7KdBdQrPRJ3gMktnRNj+KIWXBQ=="/>
         </item>
     </channel>
 </rss>
