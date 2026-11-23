@@ -1,18 +1,19 @@
 # The "tools channel" — keeps ffmpeg (+ ffprobe), deno and yt-dlp current for every installed UltraDownloader
-# WITHOUT an app release. Runs weekly on GitHub's macOS (Apple Silicon) runner.
+# WITHOUT an app release. Runs daily; the Apple Silicon Mac runner is only requested when something is new.
 #
 # LIVES IN THE REPO AS:  .github/workflows/tools.yml   (source copy: scripts/tools-workflow.yml)
 #
-# What it does:
-#   1. Finds the newest ffmpeg/ffprobe (Martin Riedl's macOS builds, SHA256-checked), deno (official
-#      GitHub release, SHA256-checked) and yt-dlp (PyPI).
-#   2. Compares with the currently published tools.json. Nothing new → stops (no release, no noise).
-#   3. SMOKE-TESTS the new tools — real encodes of every audio format we offer, an mp4 remux, the
-#      encoders we depend on, deno, and a real yt-dlp run. ANY failure fails the job (GitHub emails
-#      the repo owner) and NOTHING is published.
-#   4. Uploads the zips to the rolling release "tools", then publishes tools.json + tools.json.sig
-#      (signed with the tools key from the TOOLS_PRIVATE_KEY secret). Installed apps only trust a
-#      feed signed by the matching public key baked into the app.
+# Two jobs:
+#   check  (ubuntu, always runs) — keeps the schedule alive, finds the newest ffmpeg/ffprobe (Martin Riedl's
+#          macOS builds), deno (official GitHub release) and yt-dlp (PyPI), and compares them with the
+#          published tools.json. Nothing new → stops here (no Mac, no release, no noise).
+#   tools  (macos-15, only when check says publish) — downloads + SHA256-checks the binaries, SMOKE-TESTS
+#          them (real encodes of every audio format we offer, an mp4 remux, the encoders we depend on,
+#          deno, a real yt-dlp run; ANY failure fails the job, GitHub emails the repo owner, NOTHING is
+#          published), then uploads the zips to the rolling release "tools" and publishes tools.json +
+#          tools.json.sig (signed with the tools key from the TOOLS_PRIVATE_KEY secret). Installed apps
+#          only trust a feed signed by the matching public key baked into the app.
+# If GitHub has no free Mac on a given day, the next daily run simply tries again (tools.json is still old).
 #
 # Secret needed:  TOOLS_PRIVATE_KEY  (from `swift scripts/tools-keygen.swift`; backup in the password manager)
 
@@ -20,7 +21,7 @@ name: Tools channel
 
 on:
   schedule:
-    - cron: "23 5 * * 1"          # Mondays 05:23 UTC
+    - cron: "23 5 * * *"          # daily 05:23 UTC
   workflow_dispatch:
     inputs:
       force:
@@ -48,9 +49,17 @@ env:
   FEED: https://github.com/${{ github.repository }}/releases/download/tools
 
 jobs:
-  tools:
-    runs-on: macos-15             # Apple Silicon — the app is Apple Silicon only
-    timeout-minutes: 30
+  # Cheap Linux job, every day: is there anything to publish? Only then is a Mac requested.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      ffmpeg_version: ${{ steps.latest.outputs.ffmpeg_version }}
+      ffmpeg_base:    ${{ steps.latest.outputs.ffmpeg_base }}
+      deno_version:   ${{ steps.latest.outputs.deno_version }}
+      deno_tag:       ${{ steps.latest.outputs.deno_tag }}
+      yt_version:     ${{ steps.latest.outputs.yt_version }}
+      publish:        ${{ steps.changed.outputs.publish }}
     steps:
       # GitHub switches scheduled workflows OFF after 60 days without repo activity. Two belts:
       # re-enable ourselves every run, and make a tiny commit if the repo has been quiet for a month.
@@ -58,7 +67,7 @@ jobs:
         run: |
           gh api -X PUT "repos/$REPO/actions/workflows/tools.yml/enable" || true
           LAST=$(gh api "repos/$REPO/commits?per_page=1" --jq '.[0].commit.committer.date')
-          AGE=$(( ( $(date -u +%s) - $(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$LAST" +%s) ) / 86400 ))
+          AGE=$(( ( $(date -u +%s) - $(date -u -d "$LAST" +%s) ) / 86400 ))
           echo "last repo commit: $LAST ($AGE days ago)"
           if [ "$AGE" -ge 30 ]; then
             SHA=$(gh api "repos/$REPO/contents/heartbeat.txt" --jq .sha 2>/dev/null || true)
@@ -70,8 +79,6 @@ jobs:
         id: latest
         run: |
           set -euo pipefail
-          mkdir -p work && cd work
-
           # ffmpeg + ffprobe — Martin Riedl's macOS arm64 release builds
           HTML=$(curl -fsSL https://ffmpeg.martin-riedl.de/info/history/macos/arm64/release)
           ID=$(printf '%s' "$HTML" | grep -oE '/info/detail/macos/arm64/[0-9]+_[0-9]+(\.[0-9]+)*' | head -1 | sed 's|.*/||')
@@ -105,13 +112,19 @@ jobs:
             echo "Nothing new — feed already current."
           fi
 
+  # The Mac job: only runs when check found something new (or force). Uses check's outputs only.
+  tools:
+    needs: check
+    if: needs.check.outputs.publish == 'true'
+    runs-on: macos-15             # Apple Silicon — the app is Apple Silicon only
+    timeout-minutes: 30
+    steps:
       - name: Download + verify the binaries
-        if: steps.changed.outputs.publish == 'true'
         run: |
           set -euo pipefail
-          cd work
+          mkdir -p work && cd work
           mkdir -p ffmpeg deno
-          B="${{ steps.latest.outputs.ffmpeg_base }}"
+          B="${{ needs.check.outputs.ffmpeg_base }}"
           for f in ffmpeg ffprobe; do
             curl -fsSL -o "$f.zip" "$B/$f.zip"
             EXPECT=$(curl -fsSL "$B/$f.zip.sha256" | awk '{print $1}')
@@ -119,7 +132,7 @@ jobs:
             [ "$EXPECT" = "$ACTUAL" ] || { echo "::error::$f checksum mismatch"; exit 1; }
             unzip -o -q "$f.zip" -d ffmpeg
           done
-          T="${{ steps.latest.outputs.deno_tag }}"
+          T="${{ needs.check.outputs.deno_tag }}"
           curl -fsSL -o deno.zip "https://github.com/denoland/deno/releases/download/$T/deno-aarch64-apple-darwin.zip"
           EXPECT=$(curl -fsSL "https://github.com/denoland/deno/releases/download/$T/deno-aarch64-apple-darwin.zip.sha256sum" | awk '{print $1}')
           [ "$EXPECT" = "$(shasum -a 256 deno.zip | awk '{print $1}')" ] || { echo "::error::deno checksum mismatch"; exit 1; }
@@ -132,7 +145,6 @@ jobs:
           file ffmpeg/ffmpeg ffmpeg/ffprobe deno/deno
 
       - name: Smoke tests (fail = nothing is published)
-        if: steps.changed.outputs.publish == 'true'
         run: |
           set -euo pipefail
           cd work
@@ -171,9 +183,9 @@ jobs:
 
           echo "--- yt-dlp (pinned version, clean environment)"
           cd "$GITHUB_WORKSPACE/work"
-          python3 -m venv yt && ./yt/bin/pip install -q "yt-dlp==${{ steps.latest.outputs.yt_version }}"
+          python3 -m venv yt && ./yt/bin/pip install -q "yt-dlp==${{ needs.check.outputs.yt_version }}"
           REPORTED=$(./yt/bin/python -m yt_dlp --version)
-          [ "$REPORTED" = "${{ steps.latest.outputs.yt_version }}" ] || { echo "::error::yt-dlp reports $REPORTED"; exit 1; }
+          [ "$REPORTED" = "${{ needs.check.outputs.yt_version }}" ] || { echo "::error::yt-dlp reports $REPORTED"; exit 1; }
           # A direct-file URL (YouTube often blocks CI IPs): checks extraction + our ffmpeg/deno flags parse.
           # Two independent hosts — either one answering is enough, so one flaky site can't fail the job.
           OKURL=""
@@ -186,13 +198,12 @@ jobs:
           echo "ok yt-dlp"
 
       - name: Package + sign
-        if: steps.changed.outputs.publish == 'true'
         env:
           TOOLS_PRIVATE_KEY: ${{ secrets.TOOLS_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           cd work
-          FFV="${{ steps.latest.outputs.ffmpeg_version }}"; DNV="${{ steps.latest.outputs.deno_version }}"; YTV="${{ steps.latest.outputs.yt_version }}"
+          FFV="${{ needs.check.outputs.ffmpeg_version }}"; DNV="${{ needs.check.outputs.deno_version }}"; YTV="${{ needs.check.outputs.yt_version }}"
           mkdir -p out
           ditto -c -k ffmpeg "out/ffmpeg-$FFV-macos-arm64.zip"
           ditto -c -k deno   "out/deno-$DNV-macos-arm64.zip"
@@ -225,7 +236,7 @@ jobs:
           ls -la out
 
       - name: Publish
-        if: steps.changed.outputs.publish == 'true' && github.event.inputs.dry_run != 'true'
+        if: github.event.inputs.dry_run != 'true'
         run: |
           set -euo pipefail
           cd work/out
